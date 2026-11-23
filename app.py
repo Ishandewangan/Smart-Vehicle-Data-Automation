@@ -1,8 +1,8 @@
-import re, io, os, datetime as dt
+import re, io, os, zipfile, datetime as dt
 from copy import copy
 import pandas as pd, streamlit as st
 from openpyxl import load_workbook
-from PIL import Image
+from PIL import Image, ImageOps
 import pytesseract
 
 st.set_page_config("Smart Vehicle Data Automation", "🚗", layout="wide")
@@ -17,19 +17,45 @@ norm = lambda s: re.sub(r"\D", "", str(s or ""))
 def nums(t):
     return [norm(m) for m in re.findall(r"\d[\d\s-]*\d", t)]
 
+PFX = re.compile(r"^\[?\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4},?\s+\d{1,2}:\d{2}(:\d{2})?\s*([ap]\.?m\.?)?\]?\s*-?\s*[^:]*:", re.I)
+
+def captions(text):
+    """WhatsApp export: line with image filename, next line = caption (vehicle number)."""
+    m, last = {}, None
+    for ln in text.splitlines():
+        if PFX.match(ln):
+            rest = PFX.sub("", ln).strip()
+            f = re.match(r"(?:<attached:\s*)?(.+?\.(?:jpe?g|png))", rest, re.I)
+            last = f.group(1).strip() if f else None
+        elif last:
+            v = next((x for x in nums(ln) if len(x) in (4, 6)), None)
+            if v:
+                m[last] = v
+            last = None
+    return m
+
+def read_meter(data):
+    """OCR digits from the odometer photo; pick the longest 4-7 digit number."""
+    im = ImageOps.autocontrast(Image.open(io.BytesIO(data)).convert("L"))
+    im = im.resize((im.width * 2, im.height * 2))
+    t = pytesseract.image_to_string(im, config="--psm 6 -c tessedit_char_whitelist=0123456789")
+    c = [x for x in re.findall(r"\d+", t) if 4 <= len(x) <= 7]
+    return max(c, key=len) if c else ""
+
 def parse(text, src, date, shift, img=None):
     """Return records: vehicle = first 4/6 digit number, meter = next other number."""
     out = []
     lines = text.splitlines() if img is None else [text.replace("\n", "  ")]
     for ln in lines:
-        # strip WhatsApp prefix like "[23/11/2026, 9:15 pm] Name:" or "23/11/26, 21:15 - Name:"
-        ln = re.sub(r"^\[?\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4},?\s+\d{1,2}:\d{2}(:\d{2})?\s*([ap]\.?m\.?)?\]?\s*-?\s*[^:]*:", "", ln, flags=re.I)
+        ln = PFX.sub("", ln)
         n = nums(ln)
         veh = next((x for x in n if len(x) in (4, 6)), None)
         if not veh:
             continue
         rest = [x for x in n if x != veh and len(x) >= 2]
         meter = max(rest, key=len) if rest else ""
+        if img is None and not meter:
+            continue  # caption-only lines are linked to images separately
         out.append(dict(ok=False, vehicle=veh, meter=meter, date=str(date), shift=shift, source=src, img=img))
     return out
 
@@ -95,30 +121,37 @@ with tabs[1]:
     c1, c2 = st.columns(2)
     date = c1.date_input("Date", dt.date.today())
     shift = c2.selectbox("Shift", ["Morning", "Evening", "Night"])
-    f = st.file_uploader("Excel file", ["xlsx", "xls"])
+    f = st.file_uploader("1) Vehicle list Excel", ["xlsx", "xls"])
     if f and S.fname != f.name:
         load_excel(f)
     if S.ws is not None:
         hd = [str(c.value) for c in S.ws[1]]
         S.vcol = st.selectbox("Vehicle number column", range(1, len(hd) + 1), S.vcol - 1, format_func=lambda i: hd[i - 1]) if len(hd) else 1
         st.success(f"Loaded {S.fname}")
-    msg = st.text_area("Paste message (one vehicle per line: number + meter reading)")
-    txt = st.file_uploader("Text files", ["txt"], accept_multiple_files=True)
-    ims = st.file_uploader("Meter images", ["jpg", "jpeg", "png"], accept_multiple_files=True)
+    wa = st.file_uploader("2) WhatsApp data (exported .zip, or .txt + images together)", ["zip", "txt", "jpg", "jpeg", "png"], accept_multiple_files=True)
     if st.button("▶ Process", type="primary"):
         new, bar = [], st.progress(0.0)
-        if msg:
-            new += parse(msg, "message", date, shift)
-        for t in txt:
-            new += parse(t.read().decode(errors="ignore"), t.name, date, shift)
-        for i, im in enumerate(ims):
-            data = im.read()
+        files = []
+        for u in wa:
+            if u.name.lower().endswith(".zip"):
+                with zipfile.ZipFile(u) as z:
+                    files += [(os.path.basename(n), z.read(n)) for n in z.namelist() if not n.endswith("/")]
+            else:
+                files.append((u.name, u.read()))
+        cap = {}
+        for name, d in files:
+            if name.lower().endswith(".txt"):
+                body = d.decode(errors="ignore")
+                cap.update(captions(body))
+                new += parse(body, name, date, shift)
+        ims = [(n, d) for n, d in files if n.lower().endswith((".jpg", ".jpeg", ".png"))]
+        for i, (name, data) in enumerate(ims):
             try:
-                text = pytesseract.image_to_string(Image.open(io.BytesIO(data)), config="--psm 6")
+                meter = read_meter(data)
             except Exception as e:
-                st.error(f"OCR failed for {im.name}: {e}"); text = ""
-            r = parse(text, im.name, date, shift, data) or [dict(ok=False, vehicle="", meter="", date=str(date), shift=shift, source=im.name, img=data)]
-            new += r; S.imgs += 1
+                st.error(f"OCR failed for {name}: {e}"); meter = ""
+            new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, date=str(date), shift=shift, source=name, img=data))
+            S.imgs += 1
             bar.progress((i + 1) / len(ims))
         S.recs += new
         S.hist.append(dict(time=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event="processed", detail=f"{len(new)} records"))
