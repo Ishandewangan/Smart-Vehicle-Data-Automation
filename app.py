@@ -22,6 +22,8 @@ def parse(text, src, date, shift, img=None):
     out = []
     lines = text.splitlines() if img is None else [text.replace("\n", "  ")]
     for ln in lines:
+        # strip WhatsApp prefix like "[23/11/2026, 9:15 pm] Name:" or "23/11/26, 21:15 - Name:"
+        ln = re.sub(r"^\[?\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4},?\s+\d{1,2}:\d{2}(:\d{2})?\s*([ap]\.?m\.?)?\]?\s*-?\s*[^:]*:", "", ln, flags=re.I)
         n = nums(ln)
         veh = next((x for x in n if len(x) in (4, 6)), None)
         if not veh:
