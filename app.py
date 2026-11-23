@@ -1,7 +1,9 @@
 import re, io, os, zipfile, datetime as dt
 from copy import copy
-import pandas as pd, streamlit as st
+import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
 from PIL import Image, ImageOps
 import pytesseract
 
@@ -10,7 +12,7 @@ S = st.session_state
 for k, v in dict(wb=None, ws=None, fname=None, recs=[], hist=[], unmatched=[], dups=0, imgs=0).items():
     S.setdefault(k, v)
 os.makedirs("images", exist_ok=True)
-HDRS = ["Date", "Shift", "Meter Reading", "Image"]
+HDRS = ["Date", "Shift", "Meter Reading", "Extracted Text", "Image"]
 
 norm = lambda s: re.sub(r"\D", "", str(s or ""))
 
@@ -34,13 +36,21 @@ def captions(text):
             last = None
     return m
 
+def prepare_image(data):
+    im = ImageOps.autocontrast(Image.open(io.BytesIO(data)).convert("L"))
+    return im.resize((im.width * 2, im.height * 2))
+
 def read_meter(data):
     """OCR digits from the odometer photo; pick the longest 4-7 digit number."""
-    im = ImageOps.autocontrast(Image.open(io.BytesIO(data)).convert("L"))
-    im = im.resize((im.width * 2, im.height * 2))
-    t = pytesseract.image_to_string(im, config="--psm 6 -c tessedit_char_whitelist=0123456789")
-    c = [x for x in re.findall(r"\d+", t) if 4 <= len(x) <= 7]
-    return max(c, key=len) if c else ""
+    im = prepare_image(data)
+    text = pytesseract.image_to_string(im, config="--psm 6 -c tessedit_char_whitelist=0123456789")
+    candidates = [x for x in re.findall(r"\d+", text) if 4 <= len(x) <= 7]
+    return max(candidates, key=len) if candidates else ""
+
+def read_image_text(data):
+    """Extract general text from an image using Tesseract OCR."""
+    im = prepare_image(data)
+    return pytesseract.image_to_string(im, config="--psm 6").strip()
 
 def parse(text, src, date, shift, img=None):
     """Return records: vehicle = first 4/6 digit number, meter = next other number."""
@@ -55,8 +65,8 @@ def parse(text, src, date, shift, img=None):
         rest = [x for x in n if x != veh and len(x) >= 2]
         meter = max(rest, key=len) if rest else ""
         if img is None and not meter:
-            continue  # caption-only lines are linked to images separately
-        out.append(dict(ok=False, vehicle=veh, meter=meter, date=str(date), shift=shift, source=src, img=img))
+            continue
+        out.append(dict(ok=False, vehicle=veh, meter=meter, text="", date=str(date), shift=shift, source=src, img=img))
     return out
 
 def match(v, cell):
@@ -65,7 +75,9 @@ def match(v, cell):
 
 def load_excel(f):
     if f.name.lower().endswith(".xls"):
-        b = io.BytesIO(); pd.read_excel(f).to_excel(b, index=False); b.seek(0)
+        b = io.BytesIO()
+        pd.read_excel(f).to_excel(b, index=False)
+        b.seek(0)
         wb = load_workbook(b)
     else:
         wb = load_workbook(f)
@@ -78,8 +90,19 @@ def load_excel(f):
     for h in HDRS:
         i = next((i + 1 for i, x in enumerate(heads) if x.strip().lower() == h.lower()), None)
         if not i:
-            i = ws.max_column + 1; ws.cell(1, i, h); heads.append(h)
+            i = ws.max_column + 1
+            ws.cell(1, i, h)
+            heads.append(h)
         S.cols[h] = i
+
+def remove_images_from_row(ws, row):
+    """Remove existing embedded images anchored to a worksheet row."""
+    kept = []
+    for drawing in ws._images:
+        anchor_row = getattr(getattr(drawing, "anchor", None), "_from", None)
+        if anchor_row is None or anchor_row.row + 1 != row:
+            kept.append(drawing)
+    ws._images = kept
 
 def apply(r, on_dup):
     ws, H = S.ws, S.cols
@@ -99,19 +122,35 @@ def apply(r, on_dup):
             x = ws.max_row + 1
             for c in range(1, ws.max_column + 1):
                 s, d = ws.cell(rows[0], c), ws.cell(x, c)
-                d.value = s.value if c <= S.vcol or c == S.vcol else None
+                d.value = s.value if c == S.vcol else None
                 d._style = copy(s._style)
         st_ = "updated"
+
+    ws.cell(x, H["Date"], r["date"])
+    ws.cell(x, H["Shift"], r["shift"])
+    ws.cell(x, H["Meter Reading"], r["meter"])
+    ws.cell(x, H["Extracted Text"], r.get("text", ""))
+
     path = ""
     if r.get("img") is not None:
+        remove_images_from_row(ws, x)
         path = f"images/{r['vehicle']}_{r['date']}_{r['shift']}.png"
-        Image.open(io.BytesIO(r["img"])).save(path)
-    ws.cell(x, H["Date"], r["date"]); ws.cell(x, H["Shift"], r["shift"])
-    ws.cell(x, H["Meter Reading"], r["meter"]); ws.cell(x, H["Image"], path)
+        pil_im = Image.open(io.BytesIO(r["img"])).convert("RGB")
+        pil_im.save(path)
+
+        xl_im = XLImage(io.BytesIO(r["img"]))
+        xl_im.width = 160
+        xl_im.height = 90
+        ws.add_image(xl_im, f"{ws.cell(1, H['Image']).column_letter}{x}")
+        ws.row_dimensions[x].height = 75
+
+    ws.cell(x, H["Image"], path)
     return st_
 
 def wb_bytes():
-    b = io.BytesIO(); S.wb.save(b); return b.getvalue()
+    b = io.BytesIO()
+    S.wb.save(b)
+    return b.getvalue()
 
 # ---------------- UI ----------------
 st.title("🚗 Smart Vehicle Data Automation")
@@ -128,6 +167,7 @@ with tabs[1]:
         hd = [str(c.value) for c in S.ws[1]]
         S.vcol = st.selectbox("Vehicle number column", range(1, len(hd) + 1), S.vcol - 1, format_func=lambda i: hd[i - 1]) if len(hd) else 1
         st.success(f"Loaded {S.fname}")
+
     wa = st.file_uploader("2) WhatsApp data (exported .zip, or .txt + images together)", ["zip", "txt", "jpg", "jpeg", "png"], accept_multiple_files=True)
     if st.button("▶ Process", type="primary"):
         new, bar = [], st.progress(0.0)
@@ -138,21 +178,26 @@ with tabs[1]:
                     files += [(os.path.basename(n), z.read(n)) for n in z.namelist() if not n.endswith("/")]
             else:
                 files.append((u.name, u.read()))
+
         cap = {}
         for name, d in files:
             if name.lower().endswith(".txt"):
                 body = d.decode(errors="ignore")
                 cap.update(captions(body))
                 new += parse(body, name, date, shift)
+
         ims = [(n, d) for n, d in files if n.lower().endswith((".jpg", ".jpeg", ".png"))]
         for i, (name, data) in enumerate(ims):
             try:
                 meter = read_meter(data)
+                extracted_text = read_image_text(data)
             except Exception as e:
-                st.error(f"OCR failed for {name}: {e}"); meter = ""
-            new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, date=str(date), shift=shift, source=name, img=data))
+                st.error(f"OCR failed for {name}: {e}")
+                meter, extracted_text = "", ""
+            new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, text=extracted_text,
+                            date=str(date), shift=shift, source=name, img=data))
             S.imgs += 1
-            bar.progress((i + 1) / len(ims))
+            bar.progress((i + 1) / len(ims) if ims else 1.0)
         S.recs += new
         S.hist.append(dict(time=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event="processed", detail=f"{len(new)} records"))
         st.info(f"{len(new)} records extracted → go to Verification tab (nothing is saved until you confirm).")
@@ -161,9 +206,11 @@ with tabs[2]:
     if not S.recs:
         st.write("Nothing to verify.")
     else:
-        df = pd.DataFrame([{k: r[k] for k in ("ok", "vehicle", "meter", "date", "shift", "source")} for r in S.recs])
+        df = pd.DataFrame([{k: r[k] for k in ("ok", "vehicle", "meter", "text", "date", "shift", "source")} for r in S.recs])
         ed = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="ed")
-        pick = st.selectbox("View image for row", [i for i, r in enumerate(S.recs) if r["img"] is not None], format_func=lambda i: f"{i}: {S.recs[i]['source']}") if any(r["img"] for r in S.recs) else None
+        image_rows = [i for i, r in enumerate(S.recs) if r["img"] is not None]
+        pick = st.selectbox("View image for row", image_rows,
+                            format_func=lambda i: f"{i}: {S.recs[i]['source']}") if image_rows else None
         if pick is not None:
             st.image(S.recs[pick]["img"], width=400)
         on_dup = st.radio("If duplicate (vehicle+date+shift)", ["Skip", "Update"], horizontal=True)
@@ -175,25 +222,32 @@ with tabs[2]:
                 for i, row in ed.iterrows():
                     if not row["ok"]:
                         continue
-                    r = {**row.to_dict(), "vehicle": norm(row["vehicle"]), "img": S.recs[i]["img"] if i < len(S.recs) else None}
+                    r = {**row.to_dict(), "vehicle": norm(row["vehicle"]),
+                         "img": S.recs[i]["img"] if i < len(S.recs) else None}
                     res = apply(r, on_dup)
                     if res == "unmatched":
                         S.unmatched.append(r["vehicle"])
                     if res.startswith("duplicate"):
-                        S.dups += 1; st.warning(f"Duplicate: {r['vehicle']} {r['date']} {r['shift']} → {res}")
-                    S.hist.append(dict(time=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event=res, detail=f"{r['vehicle']} {r['meter']} {r['date']} {r['shift']}"))
+                        S.dups += 1
+                        st.warning(f"Duplicate: {r['vehicle']} {r['date']} {r['shift']} → {res}")
+                    S.hist.append(dict(time=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event=res,
+                                       detail=f"{r['vehicle']} {r['meter']} {r['date']} {r['shift']}"))
                 S.recs = [r for i, r in enumerate(S.recs) if not (i in ed.index and ed.loc[i, "ok"])]
                 st.success("Saved. See Excel tab.")
         if b.button("🗑 Reject all"):
-            S.recs = []; st.rerun()
+            S.recs = []
+            st.rerun()
 
 with tabs[3]:
     if S.ws is None:
         st.write("Upload an Excel file first.")
     else:
-        st.subheader("Original"); st.dataframe(S.orig, use_container_width=True)
-        st.subheader("Updated"); st.dataframe(pd.DataFrame(S.ws.values), use_container_width=True)
-        st.download_button("⬇ Updated Excel", wb_bytes(), "updated_" + S.fname.replace(".xls", ".xlsx") if S.fname.endswith(".xls") and not S.fname.endswith(".xlsx") else "updated_" + S.fname)
+        st.subheader("Original")
+        st.dataframe(S.orig, use_container_width=True)
+        st.subheader("Updated")
+        st.dataframe(pd.DataFrame(S.ws.values), use_container_width=True)
+        download_name = "updated_" + (S.fname.replace(".xls", ".xlsx") if S.fname.lower().endswith(".xls") else S.fname)
+        st.download_button("⬇ Updated Excel", wb_bytes(), download_name)
         st.download_button("⬇ Unmatched report", pd.DataFrame({"unmatched_vehicle": S.unmatched}).to_csv(index=False), "unmatched.csv")
         st.download_button("⬇ Processing report", pd.DataFrame(S.hist).to_csv(index=False), "report.csv")
 
