@@ -13,6 +13,7 @@ for k, v in dict(wb=None, ws=None, fname=None, recs=[], hist=[], unmatched=[], d
     S.setdefault(k, v)
 os.makedirs("images", exist_ok=True)
 HDRS = ["Date", "Shift", "Meter Reading", "Extracted Text", "Image"]
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif")
 
 norm = lambda s: re.sub(r"\D", "", str(s or ""))
 
@@ -27,7 +28,7 @@ def captions(text):
     for ln in text.splitlines():
         if PFX.match(ln):
             rest = PFX.sub("", ln).strip()
-            f = re.match(r"(?:<attached:\s*)?(.+?\.(?:jpe?g|png))", rest, re.I)
+            f = re.match(r"(?:<attached:\s*)?(.+?\.(?:jpe?g|png|webp|bmp|tiff?|gif))", rest, re.I)
             last = f.group(1).strip() if f else None
         elif last:
             v = next((x for x in nums(ln) if len(x) in (4, 6)), None)
@@ -36,8 +37,18 @@ def captions(text):
             last = None
     return m
 
+def normalize_image(data):
+    """Validate image bytes and return a normalized PNG, including EXIF orientation."""
+    with Image.open(io.BytesIO(data)) as source:
+        source.load()
+        im = ImageOps.exif_transpose(source).convert("RGB")
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        return out.getvalue()
+
 def prepare_image(data):
-    im = ImageOps.autocontrast(Image.open(io.BytesIO(data)).convert("L"))
+    normalized = normalize_image(data)
+    im = ImageOps.autocontrast(Image.open(io.BytesIO(normalized)).convert("L"))
     return im.resize((im.width * 2, im.height * 2))
 
 def read_meter(data):
@@ -131,20 +142,26 @@ def apply(r, on_dup):
     ws.cell(x, H["Meter Reading"], r["meter"])
     ws.cell(x, H["Extracted Text"], r.get("text", ""))
 
-    path = ""
+    image_data = None
     if r.get("img") is not None:
+        try:
+            image_data = normalize_image(r["img"])
+        except Exception:
+            image_data = None
+
+    if image_data:
         remove_images_from_row(ws, x)
         path = f"images/{r['vehicle']}_{r['date']}_{r['shift']}.png"
-        pil_im = Image.open(io.BytesIO(r["img"])).convert("RGB")
-        pil_im.save(path)
-
-        xl_im = XLImage(io.BytesIO(r["img"]))
+        with Image.open(io.BytesIO(image_data)) as pil_im:
+            pil_im.save(path, format="PNG")
+        xl_im = XLImage(io.BytesIO(image_data))
         xl_im.width = 160
         xl_im.height = 90
         ws.add_image(xl_im, f"{ws.cell(1, H['Image']).column_letter}{x}")
         ws.row_dimensions[x].height = 75
-
-    ws.cell(x, H["Image"], path)
+        ws.cell(x, H["Image"], path)
+    elif r.get("img") is not None:
+        st.warning(f"Image for {r.get('source', 'this record')} was unreadable; saved the row without replacing any existing image.")
     return st_
 
 def wb_bytes():
@@ -168,14 +185,17 @@ with tabs[1]:
         S.vcol = st.selectbox("Vehicle number column", range(1, len(hd) + 1), S.vcol - 1, format_func=lambda i: hd[i - 1]) if len(hd) else 1
         st.success(f"Loaded {S.fname}")
 
-    wa = st.file_uploader("2) WhatsApp data (exported .zip, or .txt + images together)", ["zip", "txt", "jpg", "jpeg", "png"], accept_multiple_files=True)
+    wa = st.file_uploader("2) WhatsApp data (exported .zip, or .txt + images together)", ["zip", "txt", "jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"], accept_multiple_files=True)
     if st.button("▶ Process", type="primary"):
         new, bar = [], st.progress(0.0)
         files = []
         for u in wa:
             if u.name.lower().endswith(".zip"):
-                with zipfile.ZipFile(u) as z:
-                    files += [(os.path.basename(n), z.read(n)) for n in z.namelist() if not n.endswith("/")]
+                try:
+                    with zipfile.ZipFile(u) as z:
+                        files += [(os.path.basename(n), z.read(n)) for n in z.namelist() if not n.endswith("/")]
+                except zipfile.BadZipFile:
+                    st.warning(f"Could not read {u.name}: the ZIP file is damaged.")
             else:
                 files.append((u.name, u.read()))
 
@@ -186,18 +206,22 @@ with tabs[1]:
                 cap.update(captions(body))
                 new += parse(body, name, date, shift)
 
-        ims = [(n, d) for n, d in files if n.lower().endswith((".jpg", ".jpeg", ".png"))]
+        ims = [(n, d) for n, d in files if n.lower().endswith(IMAGE_EXTS)]
+        if not ims:
+            bar.progress(1.0)
         for i, (name, data) in enumerate(ims):
             try:
-                meter = read_meter(data)
-                extracted_text = read_image_text(data)
+                # Normalize at upload time so OCR, preview, and Excel all receive valid PNG bytes.
+                image_data = normalize_image(data)
+                meter = read_meter(image_data)
+                extracted_text = read_image_text(image_data)
+                new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, text=extracted_text,
+                                date=str(date), shift=shift, source=name, img=image_data))
+                S.imgs += 1
             except Exception as e:
-                st.error(f"OCR failed for {name}: {e}")
-                meter, extracted_text = "", ""
-            new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, text=extracted_text,
-                            date=str(date), shift=shift, source=name, img=data))
-            S.imgs += 1
-            bar.progress((i + 1) / len(ims) if ims else 1.0)
+                # Skip this file but continue processing the remaining images.
+                st.warning(f"Skipped unreadable image {name}: {e}. Other images will still be processed.")
+            bar.progress((i + 1) / len(ims))
         S.recs += new
         S.hist.append(dict(time=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event="processed", detail=f"{len(new)} records"))
         st.info(f"{len(new)} records extracted → go to Verification tab (nothing is saved until you confirm).")
@@ -208,11 +232,15 @@ with tabs[2]:
     else:
         df = pd.DataFrame([{k: r[k] for k in ("ok", "vehicle", "meter", "text", "date", "shift", "source")} for r in S.recs])
         ed = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="ed")
-        image_rows = [i for i, r in enumerate(S.recs) if r["img"] is not None]
+        image_rows = [i for i, r in enumerate(S.recs) if r.get("img") is not None]
         pick = st.selectbox("View image for row", image_rows,
                             format_func=lambda i: f"{i}: {S.recs[i]['source']}") if image_rows else None
         if pick is not None:
-            st.image(S.recs[pick]["img"], width=400)
+            try:
+                preview_data = normalize_image(S.recs[pick]["img"])
+                st.image(preview_data, width=400)
+            except Exception:
+                st.warning(f"Could not display {S.recs[pick].get('source', 'this image')}. Choose another image or remove this record.")
         on_dup = st.radio("If duplicate (vehicle+date+shift)", ["Skip", "Update"], horizontal=True)
         a, b = st.columns(2)
         if a.button("💾 Save accepted to Excel"):
@@ -223,7 +251,7 @@ with tabs[2]:
                     if not row["ok"]:
                         continue
                     r = {**row.to_dict(), "vehicle": norm(row["vehicle"]),
-                         "img": S.recs[i]["img"] if i < len(S.recs) else None}
+                         "img": S.recs[i].get("img") if i < len(S.recs) else None}
                     res = apply(r, on_dup)
                     if res == "unmatched":
                         S.unmatched.append(r["vehicle"])
