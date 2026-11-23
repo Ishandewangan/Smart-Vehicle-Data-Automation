@@ -161,7 +161,7 @@ def apply(r, on_dup):
         ws.row_dimensions[x].height = 75
         ws.cell(x, H["Image"], path)
     elif r.get("img") is not None:
-        st.warning(f"Image for {r.get('source', 'this record')} was unreadable; saved the row without replacing any existing image.")
+        st.warning(f"Image for {r.get('source', 'this record')} was unreadable; it could not be embedded in Excel.")
     return st_
 
 def wb_bytes():
@@ -211,16 +211,33 @@ with tabs[1]:
             bar.progress(1.0)
         for i, (name, data) in enumerate(ims):
             try:
-                # Normalize at upload time so OCR, preview, and Excel all receive valid PNG bytes.
+                # Image validity is separate from OCR: preserve a valid photo even when OCR fails.
                 image_data = normalize_image(data)
-                meter = read_meter(image_data)
-                extracted_text = read_image_text(image_data)
-                new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, text=extracted_text,
-                                date=str(date), shift=shift, source=name, img=image_data))
-                S.imgs += 1
             except Exception as e:
-                # Skip this file but continue processing the remaining images.
-                st.warning(f"Skipped unreadable image {name}: {e}. Other images will still be processed.")
+                st.warning(f"Skipped unreadable image file {name}: {e}. Other photos will still be processed.")
+                bar.progress((i + 1) / len(ims))
+                continue
+
+            meter, extracted_text = "", ""
+            ocr_errors = []
+            try:
+                meter = read_meter(image_data)
+            except Exception as e:
+                ocr_errors.append(f"meter OCR: {e}")
+            try:
+                extracted_text = read_image_text(image_data)
+            except Exception as e:
+                ocr_errors.append(f"text OCR: {e}")
+
+            # Always keep a valid image as a verification record. If OCR cannot read it,
+            # the user can still approve it and embed the original photo in Excel.
+            new.append(dict(ok=False, vehicle=cap.get(name, ""), meter=meter, text=extracted_text,
+                            date=str(date), shift=shift, source=name, img=image_data))
+            S.imgs += 1
+            if ocr_errors:
+                st.warning(f"OCR could not read {name} ({'; '.join(ocr_errors)}). The image is kept; approve it to add it to Excel without OCR text.")
+            elif not meter and not extracted_text:
+                st.info(f"No text was recognized in {name}. The photo is kept and can still be added to Excel.")
             bar.progress((i + 1) / len(ims))
         S.recs += new
         S.hist.append(dict(time=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event="processed", detail=f"{len(new)} records"))
