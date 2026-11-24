@@ -1,4 +1,4 @@
-import re, io, zipfile, datetime as dt
+import re, io, zipfile, hashlib, datetime as dt
 from copy import copy
 import pandas as pd
 import streamlit as st
@@ -80,6 +80,21 @@ def fill_row(ws, row, c0, r):
 def build_excel(rows, vehicles=None):
     """vehicles=None -> one flat sheet. Else: original sheet with matched photos beside each vehicle + 'Unmatched' tab."""
     wb = Workbook(); out = wb.active
+    plates = {}
+    if vehicles is not None:
+        ws0, h0, v0 = vehicles
+        plates = {alnum(ws0.cell(r, v0).value): str(ws0.cell(r, v0).value) for r in range(h0 + 1, ws0.max_row + 1) if ws0.cell(r, v0).value}
+    for r in rows:
+        g = alnum(r["vehicle"]); c = [p for k, p in plates.items() if len(g) >= 4 and k.endswith(g)]
+        r["plate"] = c[0] if len(c) == 1 else None
+    seen, keep, dups = set(), [], []
+    for r in sorted(rows, key=lambda x: (x["date"], x["time"])):  # same photo, or same vehicle on same day -> keep the first only
+        ks = {("h", r["hash"])} | ({("v", r["plate"] or alnum(r["vehicle"]), r["date"])} if (r["plate"] or alnum(r["vehicle"])) else set())
+        if ks & seen:
+            dups.append(r)
+        else:
+            keep.append(r); seen |= ks
+    rows = keep
     if vehicles is None:
         out.title = "Meter Readings"; out.append(["Vehicle No."] + EXTRA + ["Sender", "File name"])
         unm, nc, hrow, vcol, ws = rows, 1, 1, 1, None
@@ -87,15 +102,13 @@ def build_excel(rows, vehicles=None):
     else:
         ws, hrow, vcol = vehicles
         out.title = ws.title; nc = ws.max_column
-        plates = {alnum(ws.cell(r, vcol).value): str(ws.cell(r, vcol).value) for r in range(hrow + 1, ws.max_row + 1) if ws.cell(r, vcol).value}
         matched, unm = {}, []
         for r in rows:
             g = alnum(r["vehicle"])
-            c = [p for k, p in plates.items() if len(g) >= 4 and k.endswith(g)]
-            if len(c) == 1:
-                matched.setdefault(c[0], []).append(r)
+            if r["plate"]:
+                matched.setdefault(r["plate"], []).append(r)
             else:
-                r["possible"] = ", ".join(c)
+                r["possible"] = ", ".join(p for k, p in plates.items() if len(g) >= 4 and k.endswith(g))
                 unm.append(r)
         for r in range(1, hrow + 1):
             for c in range(1, nc + 1):
@@ -140,8 +153,18 @@ def build_excel(rows, vehicles=None):
             u.cell(i, 8, r["sender"]); u.cell(i, 9, r["file"])
         for col, w in zip("ABCDEFGHI", (18, 24, 12, 10, 30, 14, 24, 18, 28)):
             u.column_dimensions[col].width = w
+    if dups:
+        d = wb.create_sheet("Duplicates")
+        d.append(["Vehicle (from text)", "Matched vehicle"] + EXTRA + ["Sender / group", "File name"])
+        for c in d[1]:
+            c.font = Font(bold=True)
+        for i, r in enumerate(dups, 2):
+            d.cell(i, 1, r["vehicle"]); d.cell(i, 2, r["plate"] or ""); fill_row(d, i, 3, r)
+            d.cell(i, 8, r["sender"]); d.cell(i, 9, r["file"])
+        for col, w in zip("ABCDEFGHI", (18, 18, 12, 10, 30, 14, 24, 24, 28)):
+            d.column_dimensions[col].width = w
     b = io.BytesIO(); wb.save(b)
-    return b.getvalue(), len(unm), sum(len(v) for v in matched.values())
+    return b.getvalue(), len(unm), sum(len(v) for v in matched.values()), len(dups)
 
 
 st.set_page_config("WhatsApp Photos → Excel", "🚗", layout="wide")
@@ -150,31 +173,36 @@ st.caption("Upload the WhatsApp export .zip (and optionally your vehicle list). 
            "Type the meter reading from the photo in the 'Meter Reading' column.")
 c1, c2 = st.columns(2)
 xl = c1.file_uploader("1) Vehicle list Excel (optional)", ["xlsx", "xls"])
-wa = c2.file_uploader("2) WhatsApp export (.zip, exported with media)", ["zip"])
+wa = c2.file_uploader("2) WhatsApp export .zip files (you can select several groups)", ["zip"], accept_multiple_files=True)
 
 if wa and st.button("▶ Create Excel", type="primary"):
-    z = zipfile.ZipFile(wa)
-    names = {n.split("/")[-1]: n for n in z.namelist()}
-    chat = next((z.read(n).decode("utf-8-sig", "replace") for n in z.namelist() if n.lower().endswith(".txt")), "")
     rows, skipped, seen = [], [], set()
-    for it in parse_chat(chat):
-        key = (it["file"], it["date"], it["time"])
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            im = ImageOps.exif_transpose(Image.open(io.BytesIO(z.read(names[it["file"]])))).convert("RGB")
-            im.thumbnail((900, 900))
-            b = io.BytesIO(); im.save(b, "JPEG", quality=80)
-            rows.append({**it, "bytes": b.getvalue()})
-        except Exception:
-            skipped.append(it["file"])
-    data, nun, nm = build_excel(rows, read_vehicles(xl) if xl else None)
-    st.session_state.out = (data, len(rows), skipped, [r["bytes"] for r in rows], nun, nm, bool(xl))
+    for up in wa:
+        z = zipfile.ZipFile(up)
+        group = re.sub(r"^WhatsApp Chat with |\.zip$|\s*\(\d+\)$", "", up.name)
+        names = {n.split("/")[-1]: n for n in z.namelist()}
+        chat = next((z.read(n).decode("utf-8-sig", "replace") for n in z.namelist() if n.lower().endswith(".txt")), "")
+        for it in parse_chat(chat):
+            key = (group, it["file"], it["date"], it["time"])
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                im = ImageOps.exif_transpose(Image.open(io.BytesIO(z.read(names[it["file"]])))).convert("RGB")
+                im.thumbnail((900, 900))
+                bb = io.BytesIO(); im.save(bb, "JPEG", quality=80)
+                rows.append({**it, "sender": f"{it['sender']} [{group}]", "bytes": bb.getvalue(),
+                             "hash": hashlib.md5(z.read(names[it["file"]])).hexdigest()})
+            except Exception:
+                skipped.append(it["file"])
+    data, nun, nm, nd = build_excel(rows, read_vehicles(xl) if xl else None)
+    st.session_state.out = (data, len(rows), skipped, [r["bytes"] for r in rows], nun, nm, bool(xl), nd)
 
 if st.session_state.get("out"):
-    data, n, skipped, imgs, nun, nm, had_xl = st.session_state.out
-    st.success(f"{n} photos saved in the Excel." + (f" {nm} matched to your vehicle list, {nun} placed in the 'Unmatched' tab." if had_xl else ""))
+    data, n, skipped, imgs, nun, nm, had_xl, nd = st.session_state.out
+    st.success(f"{n - nd} photos saved in the Excel." + (f" {nm} matched to your vehicle list, {nun} placed in the 'Unmatched' tab." if had_xl else ""))
+    if nd:
+        st.info(f"{nd} duplicate(s) removed (same photo or same vehicle on the same date in another group). They are listed in the 'Duplicates' tab.")
     if skipped:
         st.warning("Empty/unreadable images skipped: " + ", ".join(skipped))
     st.download_button("⬇ Download Excel", data, "whatsapp_meter_photos.xlsx", type="primary")
